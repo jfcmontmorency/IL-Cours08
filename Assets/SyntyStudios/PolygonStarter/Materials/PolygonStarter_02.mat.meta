@@ -1,0 +1,16 @@
+fileFormatVersion: 2
+guid: fd119fec2b9ad41f48e03a03f1a8e142
+timeCreated: 1572320897
+licenseType: Store
+NativeFormatImporter:
+  mainObjectFileID: 2100000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 156819
+  packageName: POLYGON - Starter Pack - Art by Synty
+  packageVersion: 1.2.1
+  assetPath: Assets/SyntyStudios/PolygonStarter/Materials/PolygonStarter_02.mat
+  uploadId: 976804

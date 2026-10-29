@@ -1,0 +1,16 @@
+fileFormatVersion: 2
+guid: 6670376d8bcba4fa69246c086e96f6e8
+timeCreated: 1572322089
+licenseType: Store
+NativeFormatImporter:
+  mainObjectFileID: 100100000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 156819
+  packageName: POLYGON - Starter Pack - Art by Synty
+  packageVersion: 1.2.1
+  assetPath: Assets/SyntyStudios/PolygonStarter/Prefabs/Characters/SM_Chr_Male_01.prefab
+  uploadId: 976804

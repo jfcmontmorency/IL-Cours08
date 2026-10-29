@@ -1,0 +1,415 @@
+using UnityEngine;
+using UnityEngine.AI;
+using UnityEngine.Events;
+
+/// <summary>
+/// Le PNJ suit une cible (le joueur) sur le NavMesh.
+/// - Trois zones : Portée (s'arrête et attaque), Course (court au-delà), Abandon (lâche la poursuite au-delà).
+/// - Le chemin est recalculé à intervalle régulier, pas à chaque image.
+/// - Il court quand il est loin (si un paramètre de course est fourni).
+/// - Il abandonne quand la cible est trop loin, et reprend quand elle revient.
+/// - Option : après un abandon, il erre au hasard (même logique que NPCWander).
+/// - Il se tourne avant d'avancer et, à l'arrêt, se tourne vers la cible.
+/// - Option : il attaque quand la cible est assez proche et visible, avec un délai entre deux attaques.
+/// </summary>
+[RequireComponent(typeof(NavMeshAgent))]
+public class NPCFollower : MonoBehaviour
+{
+    [Header("Target")]
+    [Tooltip("Vide = l'objet qui a le tag Player")]
+    [SerializeField] private Transform target;
+
+    [Header("Follow")]
+    [Tooltip("Portée (cercle magenta) : le PNJ s'arrête à l'intérieur et attaque la cible. Il repart dès qu'elle en sort")]
+    [SerializeField] private float reach = 2f;
+    [Tooltip("Vitesse de marche (m/s)")]
+    [SerializeField] private float walkSpeed = 1.3f;
+
+    [Header("Turning")]
+    [Tooltip("Temps (en secondes) pour faire un demi-tour complet")]
+    [SerializeField] private float halfTurnDuration = 0.75f;
+    [Tooltip("Au-delà de cet angle, le PNJ pivote sur place avant d'avancer")]
+    [SerializeField] private float maxAngleToMove = 45f;
+
+    [Header("Animation")]
+    [SerializeField] private Animator animator;
+    [Tooltip("Nom exact du Bool de marche dans l'Animator Controller")]
+    [SerializeField] private string walkParameter = "walking";
+    [Tooltip("Vitesse (m/s) à laquelle le clip de marche colle au sol : Average Velocity Z du clip. 0 = vitesse d'animation non ajustée")]
+    [SerializeField] private float walkClipSpeed = 1.3f;
+
+    [Header("Run (optional)")]
+    [Tooltip("Nom exact du Bool de course dans l'Animator Controller. Vide = le PNJ ne court jamais")]
+    [SerializeField] private string runParameter = "running";
+    [Tooltip("Au-delà de cette distance, le PNJ court (cercle rouge). Entre la Portée et cette distance, il marche")]
+    [SerializeField] private float runDistance = 6f;
+    [Tooltip("Vitesse de course (m/s)")]
+    [SerializeField] private float runSpeed = 4f;
+    [Tooltip("Vitesse (m/s) à laquelle le clip de course colle au sol : Average Velocity Z du clip. 0 = vitesse d'animation non ajustée")]
+    [SerializeField] private float runClipSpeed = 4f;
+
+    [Header("Attack (optional)")]
+    [Tooltip("Coché = le PNJ attaque la cible quand elle est dans sa Portée")]
+    [SerializeField] private bool canAttack = false;
+    [Tooltip("Délai minimal (en secondes) entre deux attaques")]
+    [SerializeField] private float attackCooldown = 1.5f;
+    [Tooltip("Nom exact du Trigger d'attaque dans l'Animator Controller. Vide = aucune animation, l'événement est quand même déclenché")]
+    [SerializeField] private string attackTrigger = "attack";
+    [Tooltip("Actions déclenchées à chaque attaque (son, dégâts, particules…)")]
+    [SerializeField] private UnityEvent onAttack;
+    [Tooltip("Coché = le PNJ n'attaque que s'il voit la cible (aucun obstacle entre ses yeux et elle)")]
+    [SerializeField] private bool requireLineOfSight = true;
+
+    [Header("Give up (optional)")]
+    [Tooltip("Au-delà de cette distance, le PNJ abandonne et reste sur place (cercle gris). 0 = il suit toujours")]
+    [SerializeField] private float giveUpDistance = 15f;
+    [Tooltip("Coché = le PNJ erre au hasard quand il a perdu la cible. Nécessite une Give Up Distance plus grande que 0")]
+    [SerializeField] private bool wanderWhenLost = false;
+    [Tooltip("Distance minimale entre le PNJ et son prochain point d'errance")]
+    [SerializeField] private float wanderMinDistance = 1f;
+    [Tooltip("Distance maximale entre le PNJ et son prochain point d'errance")]
+    [SerializeField] private float wanderMaxDistance = 8f;
+    [Tooltip("Durée de la pause à chaque arrivée, entre deux valeurs (en secondes)")]
+    [SerializeField] private Vector2 pauseMinMax = new Vector2(1f, 3f);
+
+    // Temps entre deux calculs de chemin (en secondes)
+    private const float RepathInterval = 0.2f;
+    // Vitesse (m/s) sous laquelle le PNJ est considéré immobile
+    private const float WalkThreshold = 0.1f;
+    // Après un abandon, la cible doit revenir à (giveUpDistance - cette marge) pour que le PNJ reprenne
+    private const float ResumeMargin = 2f;
+    // Limites de la vitesse de lecture de l'animation (1 = vitesse normale du clip)
+    private const float MinAnimSpeed = 0.5f;
+    private const float MaxAnimSpeed = 2.5f;
+    // Nombre d'essais pour trouver un point assez loin avant de se contenter du plus éloigné
+    private const int MaxWanderAttempts = 10;
+    // Le PNJ doit faire face à la cible (écart d'angle maximal, en degrés) pour attaquer
+    private const float AttackMaxAngle = 30f;
+    // Ligne de vue : des yeux du PNJ vers le centre du corps de la cible (hauteurs en m)
+    private const float EyeHeight = 1.6f;
+    private const float TargetAimHeight = 1f;
+    // Le PNJ s'arrête à cette fraction de la Portée : il est bien dedans quand il frappe,
+    // et la cible doit vraiment sortir de la Portée pour qu'il reparte (pas d'arrêts-départs en boucle)
+    private const float StopRatio = 0.8f;
+
+    private NavMeshAgent agent;
+    private bool following;
+    private bool running;
+    private bool lost;
+    private bool paused;
+    private float pauseEnd;
+    private float nextRepath;
+    private float desiredSpeed;
+    private bool canRun;
+    private bool hasWalkParameter;
+    private bool hasAttackTrigger;
+    private float nextAttackTime;
+
+    private void Awake()
+    {
+        agent = GetComponent<NavMeshAgent>();
+        agent.updateRotation = false;   // la rotation est gérée par ce script
+        // Un peu plus court que le seuil d'arrêt : l'agent le franchit vraiment
+        agent.stoppingDistance = StopDistance * 0.8f;
+        if (animator != null) animator.applyRootMotion = false;
+    }
+
+    private void Start()
+    {
+        // Paramètres de l'Animator : vérifiés une seule fois, au démarrage
+        canRun = !string.IsNullOrEmpty(runParameter);
+        if (animator != null)
+        {
+            hasWalkParameter = CheckParameter(walkParameter, AnimatorControllerParameterType.Bool, "l'animation de marche ne jouera pas");
+            if (canRun)
+                canRun = CheckParameter(runParameter, AnimatorControllerParameterType.Bool, "le PNJ ne courra pas");
+            if (canAttack)
+                hasAttackTrigger = CheckParameter(attackTrigger, AnimatorControllerParameterType.Trigger, "l'attaque n'aura pas d'animation");
+        }
+
+        if (target == null)
+        {
+            GameObject player = GameObject.FindGameObjectWithTag("Player");
+            if (player != null) target = player.transform;
+        }
+
+        if (target == null)
+        {
+            Debug.LogWarning($"{name} n'a pas de cible : glisser le joueur dans le champ Target, ou lui donner le tag Player.", this);
+            enabled = false;
+            return;
+        }
+
+        if (!agent.isOnNavMesh)
+        {
+            Debug.LogWarning($"{name} n'est pas sur le NavMesh : vérifier le Bake et la position du personnage.", this);
+            enabled = false;
+        }
+    }
+
+    private void Update()
+    {
+        float distance = Vector3.Distance(transform.position, target.position);
+
+        // Abandon : la cible est trop loin, le PNJ reste sur place jusqu'à ce qu'elle revienne
+        if (giveUpDistance > 0f)
+        {
+            if (!lost && distance > giveUpDistance)
+            {
+                lost = true;
+                following = false;
+                running = false;
+                agent.ResetPath();
+                // L'errance commence par une pause : le PNJ « cherche » avant de repartir
+                paused = true;
+                pauseEnd = Time.time + Random.Range(pauseMinMax.x, pauseMinMax.y);
+            }
+            else if (lost && distance < giveUpDistance - ResumeMargin)
+            {
+                lost = false;
+                agent.ResetPath();   // abandonne le point d'errance en cours
+            }
+        }
+
+        // Hystérésis : deux seuils différents pour partir et pour s'arrêter
+        if (!lost && !following && distance > reach)
+        {
+            following = true;
+            nextRepath = 0f;   // calcul immédiat au départ
+        }
+        else if (following && distance <= StopDistance)
+        {
+            following = false;
+            running = false;
+            agent.ResetPath();
+        }
+
+        if (following)
+        {
+            // Courir quand la cible est loin, revenir à la marche quand elle se rapproche
+            if (canRun)
+            {
+                if (!running && distance > runDistance) running = true;
+                else if (running && distance < reach) running = false;
+            }
+            desiredSpeed = running ? runSpeed : walkSpeed;
+
+            if (Time.time >= nextRepath)
+            {
+                agent.SetDestination(target.position);
+                nextRepath = Time.time + RepathInterval;
+            }
+
+            FaceTowards(agent.steeringTarget, true);
+        }
+        else if (lost && wanderWhenLost)
+        {
+            Wander();
+        }
+        else if (!lost)
+        {
+            // À l'arrêt : se tourner vers la cible (pas quand elle est perdue)
+            FaceTowards(target.position, false);
+        }
+
+        TryAttack(distance);
+        UpdateAnimation();
+    }
+
+    /// <summary>
+    /// Attaque si la cible est à portée, que le PNJ lui fait face et que le délai est écoulé.
+    /// </summary>
+    private void TryAttack(float distance)
+    {
+        if (!canAttack || lost) return;
+        if (distance > reach || Time.time < nextAttackTime) return;
+
+        // Faire face à la cible avant de frapper
+        Vector3 toTarget = target.position - transform.position;
+        toTarget.y = 0f;
+        if (Vector3.Angle(transform.forward, toTarget) > AttackMaxAngle) return;
+
+        // Ne pas attaquer à travers un mur
+        if (requireLineOfSight && !HasLineOfSight()) return;
+
+        nextAttackTime = Time.time + attackCooldown;
+        if (hasAttackTrigger) animator.SetTrigger(attackTrigger);
+        onAttack.Invoke();
+    }
+
+    private float StopDistance => reach * StopRatio;
+    private Vector3 EyePosition => transform.position + Vector3.up * EyeHeight;
+    private Vector3 AimPoint => target.position + Vector3.up * TargetAimHeight;
+
+    /// <summary>
+    /// Vrai si rien ne bloque la vue entre les yeux du PNJ et la cible.
+    /// Toucher un collider de la cible elle-même compte comme « vue dégagée ».
+    /// </summary>
+    private bool HasLineOfSight()
+    {
+        if (!Physics.Linecast(EyePosition, AimPoint, out RaycastHit hit, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+            return true;
+        return hit.transform.IsChildOf(target);
+    }
+
+    /// <summary>
+    /// Errance : marcher vers un point au hasard autour du PNJ, faire une pause, recommencer.
+    /// Même logique que NPCWander.
+    /// </summary>
+    private void Wander()
+    {
+        desiredSpeed = walkSpeed;
+        if (agent.pathPending) return;
+
+        bool arrived = !agent.hasPath || agent.remainingDistance <= agent.stoppingDistance;
+        if (!arrived)
+        {
+            FaceTowards(agent.steeringTarget, true);
+            return;
+        }
+
+        if (!paused)
+        {
+            paused = true;
+            pauseEnd = Time.time + Random.Range(pauseMinMax.x, pauseMinMax.y);
+        }
+        else if (Time.time >= pauseEnd)
+        {
+            if (PickWanderDestination()) paused = false;
+        }
+    }
+
+    /// <summary>
+    /// Tire un point au hasard autour du PNJ, entre wanderMinDistance et wanderMaxDistance.
+    /// Si aucun essai ne convient (bord du NavMesh, obstacles), le point le plus éloigné est retenu.
+    /// Retourne false si aucun point n'a été trouvé.
+    /// </summary>
+    private bool PickWanderDestination()
+    {
+        bool found = false;
+        Vector3 best = Vector3.zero;
+        float bestDistance = -1f;
+
+        for (int i = 0; i < MaxWanderAttempts; i++)
+        {
+            // Direction au hasard à plat, puis distance au hasard entre min et max
+            Vector2 direction = Random.insideUnitCircle.normalized;
+            float range = Random.Range(wanderMinDistance, wanderMaxDistance);
+            Vector3 point = transform.position + new Vector3(direction.x, 0f, direction.y) * range;
+            // Ramené sur le NavMesh, dans les zones permises à l'agent (ex. : pas dans la rue)
+            if (!NavMesh.SamplePosition(point, out NavMeshHit hit, wanderMaxDistance, agent.areaMask))
+                continue;
+
+            // SamplePosition peut rapprocher le point : distance revérifiée, à plat
+            Vector3 offset = hit.position - transform.position;
+            offset.y = 0f;
+            float distance = offset.magnitude;
+
+            if (distance >= wanderMinDistance)
+            {
+                agent.SetDestination(hit.position);
+                return true;
+            }
+            if (distance > bestDistance)
+            {
+                best = hit.position;
+                bestDistance = distance;
+                found = true;
+            }
+        }
+
+        if (found) agent.SetDestination(best);
+        return found;
+    }
+
+    /// <summary>
+    /// Tourne le PNJ vers un point. En déplacement, l'agent est freiné tant que
+    /// l'écart d'angle est grand : le PNJ se tourne d'abord, puis avance.
+    /// </summary>
+    private void FaceTowards(Vector3 point, bool moving)
+    {
+        Vector3 direction = point - transform.position;
+        direction.y = 0f;
+        if (direction.sqrMagnitude < 0.0001f) return;
+
+        Quaternion desiredRotation = Quaternion.LookRotation(direction);
+        transform.rotation = Quaternion.RotateTowards(transform.rotation, desiredRotation, (180f / halfTurnDuration) * Time.deltaTime);
+
+        if (moving)
+        {
+            float angle = Quaternion.Angle(transform.rotation, desiredRotation);
+            float factor = Mathf.Clamp01(1f - angle / maxAngleToMove);
+            agent.speed = desiredSpeed * factor;
+        }
+    }
+
+    private void UpdateAnimation()
+    {
+        if (animator == null) return;
+
+        bool isMoving = agent.velocity.magnitude > WalkThreshold;
+        if (hasWalkParameter) animator.SetBool(walkParameter, isMoving);
+        if (canRun) animator.SetBool(runParameter, isMoving && running);
+
+        // Vitesse de lecture : l'animation accélère ou ralentit avec le déplacement réel,
+        // pour que les pieds ne glissent pas sur le sol
+        float clipSpeed = running ? runClipSpeed : walkClipSpeed;
+        if (isMoving && clipSpeed > 0f)
+            animator.speed = Mathf.Clamp(agent.velocity.magnitude / clipSpeed, MinAnimSpeed, MaxAnimSpeed);
+        else
+            animator.speed = 1f;   // au repos, l'animation d'attente joue normalement
+    }
+
+    /// <summary>
+    /// Vérifie qu'un paramètre existe dans l'Animator Controller, avec le bon type.
+    /// Sinon, affiche un seul avertissement clair (au lieu de celui de Unity à chaque image).
+    /// </summary>
+    private bool CheckParameter(string parameterName, AnimatorControllerParameterType type, string consequence)
+    {
+        if (string.IsNullOrEmpty(parameterName)) return false;
+
+        foreach (AnimatorControllerParameter parameter in animator.parameters)
+            if (parameter.name == parameterName && parameter.type == type) return true;
+
+        string controller = animator.runtimeAnimatorController != null
+            ? animator.runtimeAnimatorController.name
+            : "(aucun Animator Controller)";
+        Debug.LogWarning($"{name} : pas de {type} \"{parameterName}\" dans {controller} : {consequence}.", this);
+        return false;
+    }
+
+    // Affiche les zones au sol dans la vue Scene (sélectionner le PNJ)
+    private void OnDrawGizmosSelected()
+    {
+#if UNITY_EDITOR
+        DrawRing(reach, Color.magenta, "Portée");
+        if (!string.IsNullOrEmpty(runParameter))
+            DrawRing(runDistance, Color.red, "Course");
+        if (giveUpDistance > 0f)
+            DrawRing(giveUpDistance, Color.gray, "Abandon");
+#endif
+
+        // Ligne de vue vers la cible (en Play) : verte = dégagée, rouge = bloquée
+        if (canAttack && requireLineOfSight && Application.isPlaying && target != null)
+        {
+            Gizmos.color = HasLineOfSight() ? Color.green : Color.red;
+            Gizmos.DrawLine(EyePosition, AimPoint);
+        }
+    }
+
+#if UNITY_EDITOR
+    /// <summary>
+    /// Dessine un cercle à plat au sol, avec son nom et son rayon (vue Scene seulement).
+    /// </summary>
+    private void DrawRing(float radius, Color color, string label)
+    {
+        if (radius <= 0f) return;
+        Vector3 center = transform.position + Vector3.up * 0.05f;   // juste au-dessus du sol
+        UnityEditor.Handles.color = color;
+        UnityEditor.Handles.DrawWireDisc(center, Vector3.up, radius, 2f);
+        GUIStyle style = new GUIStyle(UnityEditor.EditorStyles.boldLabel);
+        style.normal.textColor = color;
+        UnityEditor.Handles.Label(center + Vector3.right * radius, $" {label} {radius:0.#} m", style);
+    }
+#endif
+}
